@@ -4,6 +4,7 @@ Endpoints
 ---------
 POST   /days/{day}/upload                 append a CSV as one parquet file
 GET    /days/{day}/records                all records (consistent snapshot)
+GET    /days/{day}/conflicts              salinity conflicts (consistent snapshot)
 GET    /days/{day}/files                  active file list / count
 POST   /days/{day}/compactions            start background compaction (202)
 GET    /days/{day}/compactions            list jobs for the day
@@ -91,6 +92,7 @@ def create_app(
             "endpoints": [
                 "POST /days/{day}/upload",
                 "GET /days/{day}/records",
+                "GET /days/{day}/conflicts",
                 "GET /days/{day}/files",
                 "POST /days/{day}/compactions",
                 "GET /days/{day}/compactions",
@@ -115,6 +117,12 @@ def create_app(
     def records(day: str, request: Request):
         """All records for the day from one consistent snapshot + file count."""
         return lake(request).read_day(_valid_day(day))
+
+    @app.get("/days/{day}/conflicts")
+    @app.get("/days/{day}/conflicts/")
+    def conflicts(day: str, request: Request):
+        """Readings whose salinity disagrees for the same buoy + UTC instant."""
+        return lake(request).conflicts(_valid_day(day))
 
     @app.get("/days/{day}/files")
     def files(day: str, request: Request):

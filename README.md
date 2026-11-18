@@ -2,7 +2,8 @@
 
 单进程浮标数据湖 API：按 UTC 日分区追加上传 CSV（浮标号、UTC 时刻、盐度），
 每次上传落为一个 Parquet 文件；支持按日读取全部记录与当前文件数；支持按日
-触发后台压实，把启动时已有的若干小文件合并为一份，降低下游扫描的小文件开销。
+冲突查询（同一浮标同一 UTC 时刻盐度不一致）；支持按日触发后台压实，把启动
+时已有的若干小文件合并为一份，降低下游扫描的小文件开销。
 
 技术栈：FastAPI + PyArrow + SQLite（WAL），单进程设计。
 
@@ -37,6 +38,7 @@ python -m pytest tests/ -q
 |---|---|---|
 | POST | `/days/{day}/upload` | 上传 CSV（multipart 文件或 `text/csv` 原始 body），追加为一个 Parquet |
 | GET | `/days/{day}/records` | 读取当日全部记录（一致快照），含 `file_count`/`row_count` |
+| GET | `/days/{day}/conflicts` | 当日盐度冲突查询（一致快照），含每条读数来源批次 |
 | GET | `/days/{day}/files` | 当日活跃文件清单与文件数 |
 | POST | `/days/{day}/compactions` | 启动后台压实（202）；当日已有压实进行中返回 409 |
 | GET | `/days/{day}/compactions` | 当日压实任务列表 |
@@ -58,10 +60,70 @@ curl -X POST -H "Content-Type: text/csv" --data-binary @obs.csv \
 # 读取全部记录与文件数
 curl http://localhost:8000/days/2026-11-18/records
 
+# 盐度冲突查询：同一浮标 + 同一 UTC 时刻出现不同盐度
+curl http://localhost:8000/days/2026-11-18/conflicts
+
 # 启动压实并轮询状态
 curl -X POST http://localhost:8000/days/2026-11-18/compactions
 curl http://localhost:8000/days/2026-11-18/compactions/1
 ```
+
+## 冲突查询（`GET /days/{day}/conflicts`）
+
+同一 `buoy_id` 在同一 `ts_utc` 上出现**两个及以上不同的有限盐度值**即为冲突。
+盐度相同（包括同一行重复、同一值被多次上传）**不算冲突**，只累加到该读数的
+`count`，因此不会把重复上传误报成新的冲突。`NaN`/`Inf` 等非有限值不参与冲突
+判定。
+
+```jsonc
+{
+  "day": "2026-11-18",
+  "conflict_count": 1,
+  "file_count": 3,
+  "conflicts": [
+    {
+      "buoy_id": "B001",
+      "ts_utc": "2026-11-18T00:00:00Z",
+      "salinity_values": [35.1, 35.9],
+      "readings": [
+        {
+          "salinity": 35.1,
+          "count": 3,                       // 同值出现次数（含重复上传）
+          "source_file": "part-<uuid>.parquet",  // 主来源批次（=上传响应 file）
+          "row_numbers": [1, 2],            // 该批次内的行号（1 起）
+          "row_count": 3,                   // 该上传批次的总行数
+          "source_known": true,
+          "sources": [ /* 该值出现过的每个上传批次 */ ]
+        },
+        { "salinity": 35.9, "count": 1, /* ... */ }
+      ],
+      "files": [ /* 本冲突涉及的全部批次文件名与行号 */ ]
+    }
+  ],
+  "readings": [ /* 与 conflicts 相同的信息，按「读数」扁平展开 */ ]
+}
+```
+
+来源批次标识就是 `POST /upload` 响应中的 `file` 文件名。每条扫描的 `row_count`
+是该次原始上传的总行数（不是压实输出的大小）。无法追溯来源的既有压实行返回
+`source_file: null` 且 `source_known: false`，**不会**冒用压实输出文件名。
+
+### 来源如何跨越压实保留
+
+上传时在 Parquet 内写入三列逐行来源：`source_file`（批次文件名）、
+`source_row`（批次内第几行，1 起）、`source_rows`（该批次总行数）。这些列随
+数据一起被压实复制，因此 **退役并删除原始文件后，每行仍指向原上传批次**。
+
+- **既有未压实文件**（无来源列）：按该文件自身文件名归源，行号按文件内顺序
+  计算，行数为该文件行数。
+- **既有压实文件**（无来源列、`kind=compacted`）：来源标记为未知（`null`），
+  因为原始批次信息已不可考，不能拿压实输出名冒充。
+- 仅含部分来源列的文件按已有列处理，缺失列按上述回退规则补齐。
+- `GET /records` 仍只返回 `buoy_id/ts_utc/salinity` 三列并保留重复行；新旧
+  文件混读、以及读与冲突查询混合都可用。
+- 压实失败只会把任务标为 `failed`，输入文件保持 active，冲突结果不变。
+- 冲突查询与 `records` 使用同一套「快照 + 引用计数」：一次查询只读取切换前
+  或切换后的完整文件集合；压实期间追加的数据在后续查询中可见。
 
 ## 一致性与可靠性设计
 
@@ -95,9 +157,13 @@ curl http://localhost:8000/days/2026-11-18/compactions/1
 data/
   lake_meta.db                 # SQLite 元数据（files 登记表 + compactions 任务表）
   dt=2026-11-18/
-    part-<uuid>.parquet        # 上传产生的文件
-    compacted-<job>-<id>.parquet  # 压实输出
+    part-<uuid>.parquet        # 上传产生的文件（含逐行来源列）
+    compacted-<job>-<id>.parquet  # 压实输出（沿用输入的逐行来源列）
 ```
+
+每个 Parquet 文件在 `buoy_id, ts_utc, salinity` 之外还带有
+`source_file, source_row, source_rows` 三列来源信息；`GET /records` 只投影
+前三列，因此对外契约不变。
 
 ## 配置（环境变量）
 

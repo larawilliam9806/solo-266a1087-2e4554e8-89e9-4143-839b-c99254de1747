@@ -6,13 +6,18 @@ import json
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
+import pyarrow.parquet as pq
 import pytest
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import pyarrow as pa  # noqa: E402
+
+from app.csvio import CANONICAL_SCHEMA  # noqa: E402
 from app.db import connect  # noqa: E402
 from app.lake import Lake  # noqa: E402
 from app.main import create_app  # noqa: E402
@@ -391,3 +396,420 @@ def test_concurrent_reads_during_compaction_are_consistent(tmp_path):
         for t in threads:
             t.join()
         assert not errors, errors
+
+
+# ---------------------------------------------------------------------------
+# daily conflict query + per-row provenance
+# ---------------------------------------------------------------------------
+
+CONFLICT_DAY = "2026-11-18"
+
+# B001 at 00:00 has two distinct salinities across two uploads; the third
+# CSV repeats 35.1 twice, which must be counted but must not become a
+# separate conflict on its own.
+CSV_CONF_A = (
+    "buoy_id,ts_utc,salinity\n"
+    "B001,2026-11-18T00:00:00Z,35.1\n"
+    "B002,2026-11-18T00:05:00Z,34.0\n"
+)
+CSV_CONF_B = (
+    "buoy_id,ts_utc,salinity\n"
+    "B001,2026-11-18T00:00:00Z,35.9\n"
+    "B002,2026-11-18T00:05:00Z,34.0\n"
+)
+CSV_CONF_C = (
+    "buoy_id,ts_utc,salinity\n"
+    "B001,2026-11-18T00:00:00Z,35.1\n"
+    "B001,2026-11-18T00:00:00Z,35.1\n"
+)
+
+
+def conflicts(client: TestClient, day: str = CONFLICT_DAY) -> dict:
+    r = client.get(f"/days/{day}/conflicts")
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_conflicts_identify_batches_and_ignore_equal_duplicates(tmp_path):
+    with make_client(tmp_path) as c:
+        up_a = upload(c, CSV_CONF_A)
+        up_b = upload(c, CSV_CONF_B)
+        up_c = upload(c, CSV_CONF_C)
+
+        body = conflicts(c)
+        assert body["conflict_count"] == 1
+        (entry,) = body["conflicts"]
+        assert entry["buoy_id"] == "B001"
+        assert entry["ts_utc"] == "2026-11-18T00:00:00Z"
+        assert entry["salinity_values"] == [35.1, 35.9]
+
+        by_sal = {r["salinity"]: r for r in entry["readings"]}
+        assert by_sal[35.1]["count"] == 3          # repeated equal values counted
+        assert by_sal[35.9]["count"] == 1
+        # equal-valued duplicates did not create additional conflicts
+        assert body["conflict_count"] == 1
+
+        src_351 = {s["file"]: s for s in by_sal[35.1]["sources"]}
+        assert set(src_351) == {up_a["file"], up_c["file"]}
+        assert src_351[up_a["file"]]["row_numbers"] == [1]
+        assert src_351[up_a["file"]]["row_count"] == 2
+        assert src_351[up_c["file"]]["row_numbers"] == [1, 2]
+        assert src_351[up_c["file"]]["row_count"] == 2
+
+        # the non-conflicting buoy at a different instant is absent
+        assert all(e["buoy_id"] != "B002" for e in body["conflicts"])
+
+
+def test_conflicts_survive_compaction_and_reclaim(tmp_path):
+    with make_client(tmp_path, gc_interval_sec=0.1) as c:
+        up_a = upload(c, CSV_CONF_A)
+        up_b = upload(c, CSV_CONF_B)
+        upload(c, CSV_CONF_C)
+        before = conflicts(c)
+
+        job_id = c.post(f"/days/{DAY}/compactions").json()["job_id"]
+        assert wait_job(c, DAY, job_id)["status"] == "done"
+
+        # retirement + unlink of the inputs must not lose provenance
+        deadline = time.time() + 10
+        day_dir = tmp_path / "data" / f"dt={DAY}"
+        while time.time() < deadline:
+            if not (day_dir / up_a["file"]).exists() and not (day_dir / up_b["file"]).exists():
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("retired upload files were not reclaimed")
+
+        after = conflicts(c)
+        assert after["conflicts"] == before["conflicts"]  # conflict result unchanged
+        assert after["file_count"] == 1
+        assert c.get(f"/days/{DAY}/records").json()["file_count"] == 1
+
+
+def test_records_keep_three_columns_and_duplicates_after_compaction(tmp_path):
+    with make_client(tmp_path) as c:
+        upload(c, CSV_DUP)
+        before = c.get(f"/days/{DAY}/records").json()
+        assert before["row_count"] == 2
+        assert all(set(rec) == {"buoy_id", "ts_utc", "salinity"} for rec in before["records"])
+
+        job_id = c.post(f"/days/{DAY}/compactions").json()["job_id"]
+        assert wait_job(c, DAY, job_id)["status"] == "done"
+
+        after = c.get(f"/days/{DAY}/records").json()
+        assert after["row_count"] == 2             # duplicate rows preserved
+        assert all(set(rec) == {"buoy_id", "ts_utc", "salinity"} for rec in after["records"])
+        assert sorted((r["buoy_id"], r["ts_utc"], r["salinity"]) for r in after["records"]) == \
+               sorted((r["buoy_id"], r["ts_utc"], r["salinity"]) for r in before["records"])
+
+
+def test_appends_during_compaction_appear_in_later_conflict_query(tmp_path):
+    """Rows appended while a compaction runs show up afterwards, still sourced."""
+    with make_client(tmp_path, compaction_delay_sec=0.5) as c:
+        upload(c, CSV_CONF_A)
+        job_id = c.post(f"/days/{DAY}/compactions").json()["job_id"]
+        during = upload(c, CSV_CONF_B)            # appended mid-compaction
+
+        # every query sees a complete pre- or post-switch file set: the new
+        # row is present in both, so the conflict is always reported
+        for _ in range(8):
+            body = conflicts(c)
+            assert body["conflict_count"] == 1
+            assert during["file"] in {
+                s["file"] for s in body["conflicts"][0]["readings"][1]["sources"]
+            }
+            time.sleep(0.03)
+
+        assert wait_job(c, DAY, job_id)["status"] == "done"
+        body = conflicts(c)
+        assert body["conflict_count"] == 1
+        assert c.get(f"/days/{DAY}/records").json()["file_count"] == 2
+
+
+def test_legacy_uncompacted_file_uses_own_filename(tmp_path):
+    """A pre-provenance upload file is attributed to its own filename."""
+    data_dir = tmp_path / "data"
+    lake = Lake(str(data_dir))
+    lake.upload(DAY, CSV_CONF_A.encode())
+    lake.upload(DAY, CSV_CONF_B.encode())
+
+    # rewrite one file in the legacy 3-column format, keeping its registration
+    with connect(str(lake.db_path)) as conn:
+        path = conn.execute(
+            "SELECT path FROM files WHERE state = 'active' ORDER BY id LIMIT 1"
+        ).fetchone()["path"]
+    legacy = pa.table(
+        {
+            "buoy_id": ["B001"],
+            "ts_utc": [datetime(2026, 11, 18, 0, 0, tzinfo=timezone.utc)],
+            "salinity": [35.1],
+        },
+        schema=CANONICAL_SCHEMA,
+    )
+    pq.write_table(legacy, path)
+    del lake
+
+    with make_client(tmp_path) as c:
+        body = conflicts(c)
+        assert body["conflict_count"] == 1
+        readings = {r["salinity"]: r for r in body["conflicts"][0]["readings"]}
+        assert readings[35.1]["file"] == Path(path).name    # its own filename
+        assert readings[35.1]["source_known"] is True
+
+
+def test_legacy_compacted_rows_have_unknown_source(tmp_path):
+    """A pre-provenance compaction output must not claim its own filename."""
+    data_dir = tmp_path / "data"
+    lake = Lake(str(data_dir))
+    legacy = pa.table(
+        {
+            "buoy_id": ["B001", "B001"],
+            "ts_utc": [
+                datetime(2026, 11, 18, 0, 0, tzinfo=timezone.utc),
+                datetime(2026, 11, 18, 0, 0, tzinfo=timezone.utc),
+            ],
+            "salinity": [35.1, 35.9],
+        },
+        schema=CANONICAL_SCHEMA,
+    )
+    day_dir = data_dir / f"dt={DAY}"
+    day_dir.mkdir(parents=True)
+    legacy_path = day_dir / "compacted-1-legacy.parquet"
+    pq.write_table(legacy, legacy_path)
+    with connect(str(lake.db_path)) as conn:
+        conn.execute(
+            "INSERT INTO files(day, path, kind, state, rows, created_at)"
+            " VALUES (?, ?, 'compacted', 'active', 2, '2026-11-18T00:00:00Z')",
+            (DAY, str(legacy_path)),
+        )
+    del lake
+
+    with make_client(tmp_path) as c:
+        body = conflicts(c)
+        assert body["conflict_count"] == 1
+        for reading in body["conflicts"][0]["readings"]:
+            assert reading["file"] is None
+            assert reading["source_known"] is False
+            assert reading["sources"][0]["file"] is None
+            assert legacy_path.name not in json.dumps(body)
+        # the original three-column read still works
+        assert c.get(f"/days/{DAY}/records").json()["row_count"] == 2
+
+
+def test_mixed_legacy_and_current_files_read_and_query(tmp_path):
+    """Mixing a legacy 3-column file with new files must work for both APIs."""
+    data_dir = tmp_path / "data"
+    lake = Lake(str(data_dir))
+    lake.upload(DAY, CSV_CONF_B.encode())  # current format: 35.9 at 00:00
+
+    legacy = pa.table(
+        {
+            "buoy_id": ["B001"],
+            "ts_utc": [datetime(2026, 11, 18, 0, 0, tzinfo=timezone.utc)],
+            "salinity": [35.1],
+        },
+        schema=CANONICAL_SCHEMA,
+    )
+    day_dir = data_dir / f"dt={DAY}"
+    legacy_path = day_dir / "part-legacy.parquet"
+    pq.write_table(legacy, legacy_path)
+    with connect(str(lake.db_path)) as conn:
+        conn.execute(
+            "INSERT INTO files(day, path, kind, state, rows, created_at)"
+            " VALUES (?, ?, 'upload', 'active', 1, '2026-11-18T00:00:00Z')",
+            (DAY, str(legacy_path)),
+        )
+    del lake
+
+    with make_client(tmp_path) as c:
+        recs = c.get(f"/days/{DAY}/records").json()
+        assert recs["row_count"] == 3
+        assert recs["file_count"] == 2
+        assert all(set(r) == {"buoy_id", "ts_utc", "salinity"} for r in recs["records"])
+
+        body = conflicts(c)
+        assert body["conflict_count"] == 1
+        readings = {r["salinity"]: r for r in body["conflicts"][0]["readings"]}
+        assert readings[35.1]["file"] == "part-legacy.parquet"
+        assert readings[35.9]["file"] != "part-legacy.parquet"
+
+        # compaction over the mixed set keeps both sources distinguishable
+        job_id = c.post(f"/days/{DAY}/compactions").json()["job_id"]
+        assert wait_job(c, DAY, job_id)["status"] == "done"
+        after = conflicts(c)
+        readings = {r["salinity"]: r for r in after["conflicts"][0]["readings"]}
+        assert readings[35.1]["file"] == "part-legacy.parquet"
+        assert readings[35.9]["file"] != "part-legacy.parquet"
+
+
+def test_failed_compaction_does_not_change_conflicts(tmp_path, monkeypatch):
+    import app.lake as lake_mod
+
+    with make_client(tmp_path) as c:
+        upload(c, CSV_CONF_A)
+        upload(c, CSV_CONF_B)
+        upload(c, CSV_CONF_C)
+        before = conflicts(c)
+
+        monkeypatch.setattr(
+            lake_mod, "write_parquet_atomic",
+            lambda *a, **k: (_ for _ in ()).throw(IOError("disk full (simulated)")),
+        )
+        job = wait_job(c, DAY, c.post(f"/days/{DAY}/compactions").json()["job_id"])
+        assert job["status"] == "failed"
+
+        assert conflicts(c) == before
+        assert c.get(f"/days/{DAY}/records").json()["row_count"] == 6
+
+
+def test_conflicts_ignore_non_finite_and_incomplete(tmp_path):
+    """Only finite salinities participate; NaN never creates or masks conflicts."""
+    with make_client(tmp_path) as c:
+        upload(c, "buoy_id,ts_utc,salinity\n"
+                 "B001,2026-11-18T00:00:00Z,nan\n"
+                 "B001,2026-11-18T00:00:00Z,35.1\n"
+                 "B001,2026-11-18T00:00:00Z,35.1\n")
+        body = conflicts(c)
+        assert body["conflict_count"] == 0
+        assert body["readings"] == []
+
+
+def test_conflicts_query_is_single_consistent_snapshot(tmp_path):
+    """A conflict query uses the complete pre- or post-switch file set."""
+    with make_client(tmp_path, compaction_delay_sec=0.4) as c:
+        upload(c, CSV_CONF_A)
+        upload(c, CSV_CONF_B)
+        upload(c, CSV_CONF_C)
+        job_id = c.post(f"/days/{DAY}/compactions").json()["job_id"]
+
+        seen = []
+        errors = []
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            try:
+                body = conflicts(c)
+                # 1 conflicting (buoy, instant), 2 distinct salinities, 4 rows
+                assert body["conflict_count"] == 1
+                assert sum(r["count"] for r in body["conflicts"][0]["readings"]) == 4
+                seen.append(body["file_count"])
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+            time.sleep(0.01)
+        assert wait_job(c, DAY, job_id)["status"] == "done"
+        assert not errors, errors
+        assert set(seen) <= {1, 3}
+        assert 3 in seen and 1 in seen
+
+        after = conflicts(c)
+        assert after["conflict_count"] == 1
+        assert after["file_count"] == 1
+
+
+def test_conflicts_endpoint_validates_day(tmp_path):
+    with make_client(tmp_path) as c:
+        assert c.get("/days/2026-13-01/conflicts").status_code == 400
+        assert c.get("/days/18-11-2026/conflicts").status_code == 400
+
+
+def test_conflicts_empty_day(tmp_path):
+    with make_client(tmp_path) as c:
+        body = conflicts(c)
+        assert body["conflict_count"] == 0
+        assert body["conflicts"] == [] and body["readings"] == []
+
+
+def _write_legacy(day_dir: Path, name: str, rows: list[tuple[str, datetime, float]]) -> Path:
+    """Write a pre-provenance (3-column) parquet file."""
+    path = day_dir / name
+    table = pa.table(
+        {
+            "buoy_id": [r[0] for r in rows],
+            "ts_utc": [r[1] for r in rows],
+            "salinity": [r[2] for r in rows],
+        },
+        schema=CANONICAL_SCHEMA,
+    )
+    pq.write_table(table, path)
+    return path
+
+
+def test_legacy_compacted_conflict_with_new_upload_stays_unknown(tmp_path):
+    """An untraceable legacy compaction output conflicts with a new upload.
+
+    The legacy rows must report unknown provenance; only the new upload's
+    rows name a batch, and the compaction output's own name is never claimed.
+    """
+    data_dir = tmp_path / "data"
+    lake = Lake(str(data_dir))
+    day_dir = data_dir / f"dt={DAY}"
+    day_dir.mkdir(parents=True, exist_ok=True)
+    legacy_path = _write_legacy(
+        day_dir,
+        "compacted-7-deadbeef.parquet",
+        [("B001", datetime(2026, 11, 18, 0, 0, tzinfo=timezone.utc), 35.1)],
+    )
+    with connect(str(lake.db_path)) as conn:
+        conn.execute(
+            "INSERT INTO files(day, path, kind, state, rows, created_at)"
+            " VALUES (?, ?, 'compacted', 'active', 1, '2026-11-18T00:00:00Z')",
+            (DAY, str(legacy_path)),
+        )
+    del lake
+
+    with make_client(tmp_path) as c:
+        up = upload(c, "buoy_id,ts_utc,salinity\nB001,2026-11-18T00:00:00Z,35.9\n")
+        body = conflicts(c)
+        assert body["conflict_count"] == 1
+        readings = {r["salinity"]: r for r in body["conflicts"][0]["readings"]}
+
+        assert readings[35.1]["source_known"] is False
+        assert readings[35.1]["source_file"] is None
+        assert readings[35.1]["row_count"] is None
+        assert readings[35.1]["salinity"] == 35.1
+
+        assert readings[35.9]["source_known"] is True
+        assert readings[35.9]["source_file"] == up["file"]
+        assert readings[35.9]["row_numbers"] == [1]
+
+        # the output filename appears nowhere as a claimed source
+        assert legacy_path.name not in json.dumps(body)
+
+        # compacting the mixed set keeps the unknown rows unknown
+        job_id = c.post(f"/days/{DAY}/compactions").json()["job_id"]
+        assert wait_job(c, DAY, job_id)["status"] == "done"
+        after = conflicts(c)
+        assert after["conflict_count"] == 1
+        readings = {r["salinity"]: r for r in after["conflicts"][0]["readings"]}
+        assert readings[35.1]["source_known"] is False
+        assert readings[35.9]["source_file"] == up["file"]
+        assert legacy_path.name not in json.dumps(after)
+
+
+def test_conflicts_across_three_uploads_and_multiple_groups(tmp_path):
+    with make_client(tmp_path) as c:
+        up1 = upload(c, "buoy_id,ts_utc,salinity\n"
+                        "B1,2026-11-18T00:00:00Z,35.0\n"
+                        "B2,2026-11-18T00:00:00Z,34.0\n")
+        up2 = upload(c, "buoy_id,ts_utc,salinity\n"
+                        "B1,2026-11-18T00:00:00Z,35.5\n"
+                        "B3,2026-11-18T00:10:00Z,33.0\n")
+        up3 = upload(c, "buoy_id,ts_utc,salinity\n"
+                        "B3,2026-11-18T00:10:00Z,33.8\n"
+                        "B3,2026-11-18T00:10:00Z,33.8\n")
+
+        body = conflicts(c)
+        assert body["conflict_count"] == 2
+        keyed = {(e["buoy_id"], e["ts_utc"]): e for e in body["conflicts"]}
+
+        b1 = keyed[("B1", "2026-11-18T00:00:00Z")]
+        assert {r["source_file"] for r in b1["readings"]} == {up1["file"], up2["file"]}
+
+        b3 = keyed[("B3", "2026-11-18T00:10:00Z")]
+        r33 = next(r for r in b3["readings"] if r["salinity"] == 33.8)
+        assert r33["count"] == 2                       # same-value duplicate counted
+        assert r33["source_file"] == up3["file"]
+        assert r33["row_numbers"] == [1, 2]
+        assert r33["row_count"] == 2
+        assert len(b3["readings"]) == 2                # only two distinct values
+
+        assert len(body["readings"]) == 4              # 2 readings per conflict

@@ -23,6 +23,28 @@ CANONICAL_SCHEMA = pa.schema(
     ]
 )
 
+# Per-row provenance columns.  These travel *inside* the parquet data (not in
+# a side table) so they survive compaction: when several uploads are merged,
+# every row keeps pointing at the upload batch it originally came from, even
+# after that upload's file has been reclaimed.
+#
+#   source_file -- filename returned by ``POST /upload`` (the batch id)
+#   source_row  -- 1-based record number inside that upload
+#   source_rows -- total number of records in that upload
+#
+# Legacy parquet files written before provenance existed only have the three
+# data columns; readers fall back to the registered file kind (see lake.py).
+PROVENANCE_SCHEMA = pa.schema(
+    [
+        pa.field("source_file", pa.string()),
+        pa.field("source_row", pa.int64()),
+        pa.field("source_rows", pa.int64()),
+    ]
+)
+
+# Schema of newly written files (uploads and compaction outputs).
+LAKE_SCHEMA = pa.schema(list(CANONICAL_SCHEMA) + list(PROVENANCE_SCHEMA))
+
 
 class CsvError(ValueError):
     """Raised when an uploaded CSV cannot be parsed."""
@@ -143,3 +165,7 @@ def parse_csv(content: bytes) -> pa.Table:
 
 def empty_table() -> pa.Table:
     return CANONICAL_SCHEMA.empty_table()
+
+
+def empty_lake_table() -> pa.Table:
+    return LAKE_SCHEMA.empty_table()
